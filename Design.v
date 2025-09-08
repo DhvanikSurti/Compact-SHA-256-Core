@@ -9,7 +9,7 @@ module sha256_core(
 
     parameter H0_IV = 32'h6a09e667, H1_IV = 32'hbb67ae85;
     parameter H2_IV = 32'h3c6ef372, H3_IV = 32'ha54ff53a;
-    parameter H4_IV = 32'h510e527f, H5_IV = 32'h9b05688c;
+    parameter H4_IV = 32'h510e527f, H5_IV = 32'h9b05688c;    
     parameter H6_IV = 32'h1f83d9ab, H7_IV = 32'h5be0cd19;
 
     parameter S_IDLE=2'd0, S_LOAD=2'd1, S_RUN=2'd2, S_FIN=2'd3;
