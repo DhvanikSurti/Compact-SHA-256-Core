@@ -1,264 +1,193 @@
-// -----------------------------------------------------------------------------
-// SHA-256 single-block core: 10-cycle design (1 load + 8 compute + 1 finalize)
-// - 8 rounds per cycle
-// - Single 512-bit padded block only (no multi-block chaining)
-// - Fixed IV from FIPS 180-4
-// - Operates comfortably at <= 15 MHz target
-// -----------------------------------------------------------------------------
-module sha256_core (
-    input  wire         clk,
-    input  wire         rst_n,          // active-low reset
-    input  wire         start,          // pulse high for 1 cycle to start
-    input  wire [511:0] block_in,       // one padded 512-bit block, MSB-first W0..W15
-    output reg  [255:0] digest,         // H0..H7 concatenated
-    output reg          digest_valid    // 1 when digest is valid for 1+ cycles
+module sha256_core(
+    input wire clk,
+    input wire rst_n,
+    input wire start,
+    input wire [511:0] block_in,
+    output reg [255:0] digest,
+    output reg digest_valid
 );
 
-    // ---- IV (FIPS 180-4) ----
-    parameter H0_IV = 32'h6a09e667;
-    parameter H1_IV = 32'hbb67ae85;
-    parameter H2_IV = 32'h3c6ef372;
-    parameter H3_IV = 32'ha54ff53a;
-    parameter H4_IV = 32'h510e527f;
-    parameter H5_IV = 32'h9b05688c;
-    parameter H6_IV = 32'h1f83d9ab;
-    parameter H7_IV = 32'h5be0cd19;
+    parameter H0_IV = 32'h6a09e667, H1_IV = 32'hbb67ae85;
+    parameter H2_IV = 32'h3c6ef372, H3_IV = 32'ha54ff53a;
+    parameter H4_IV = 32'h510e527f, H5_IV = 32'h9b05688c;
+    parameter H6_IV = 32'h1f83d9ab, H7_IV = 32'h5be0cd19;
 
-    // FSM
     parameter S_IDLE=2'd0, S_LOAD=2'd1, S_RUN=2'd2, S_FIN=2'd3;
-    reg [1:0] state, state_n;
+    reg [1:0] state, nxt_state;
+    reg [5:0] tbase, nxt_tbase;
 
-    // round base index (0,8,16,...,56)
-    reg  [5:0] tbase, tbase_n; // 0..63, step by 8
+    reg [31:0] a,b,c,d,e,f,g,h;
+    reg [31:0] an,bn,cn,dn,en,fn,gn,hn;
 
-    // Working variables (a..h)
-    reg  [31:0] a,b,c,d,e,f,g,h;
-    reg  [31:0] a_n,b_n,c_n,d_n,e_n,f_n,g_n,h_n;
+    reg [31:0] H0,H1,H2,H3,H4,H5,H6,H7;
 
-    // Preserve IV to add at the end
-    reg  [31:0] H0,H1,H2,H3,H4,H5,H6,H7;
+    reg [511:0] win, win_nxt;
 
-    // Message schedule rolling window W[t..t+15]
-    reg  [511:0] win ;
-    reg  [511:0] win_n ;
+    wire [255:0] W_flat;
+    wire [511:0] win_out;
+    wire [255:0] K_flat;
 
-    // Outputs from submodules (combinational)
-    wire [255:0] W_flat;   // packed W[t..t+7]
-    wire [511:0] win_next; // packed W[t+8..t+23]
-    wire [255:0] K_flat;   // packed K[t..t+7]
+    wire [31:0] a8,b8,c8,d8,e8,f8,g8,h8;
 
-    wire [31:0] a8,b8,c8,d8,e8,f8,g8,h8; // after 8 rounds
-
-    // -------------------------
-    // Instances
-    // -------------------------
-    sha256_msg_sched8 u_sched (
-        .win_in   (win),
-        .W_flat   (W_flat),
-        .win_out  (win_next)
+    sha256_msg_sched8 sched_inst(
+        .win_in(win),
+        .W_flat(W_flat),
+        .win_out(win_out)
     );
 
-    sha256_krom8 u_krom (
-        .tbase  (tbase),
-        .K_flat (K_flat)
+    sha256_krom8 krom_inst(
+        .tbase(tbase),
+        .K_flat(K_flat)
     );
 
-    sha256_round8 u_round8 (
-        .a_in(a), .b_in(b), .c_in(c), .d_in(d),
-        .e_in(e), .f_in(f), .g_in(g), .h_in(h),
-        .W_flat (W_flat),
-        .K_flat (K_flat),
-        .a_out(a8), .b_out(b8), .c_out(c8), .d_out(d8),
-        .e_out(e8), .f_out(f8), .g_out(g8), .h_out(h8)
+    sha256_round8 round_inst(
+        .a_in(a),.b_in(b),.c_in(c),.d_in(d),
+        .e_in(e),.f_in(f),.g_in(g),.h_in(h),
+        .W_flat(W_flat),.K_flat(K_flat),
+        .a_out(a8),.b_out(b8),.c_out(c8),.d_out(d8),
+        .e_out(e8),.f_out(f8),.g_out(g8),.h_out(h8)
     );
 
-    // -------------------------
-    // Next-state logic
-    // -------------------------
     integer i;
     always @* begin
-        // defaults
-        state_n       = state;
-        tbase_n       = tbase;
-        digest_valid  = 1'b0;
+        nxt_state = state;
+        nxt_tbase = tbase;
+        digest_valid = 1'b0;
+        an=a; bn=b; cn=c; dn=d; en=e; fn=f; gn=g; hn=h;
+        win_nxt=win;
 
-        // keep current unless overwritten
-        a_n=a; b_n=b; c_n=c; d_n=d; e_n=e; f_n=f; g_n=g; h_n=h;
-        for (i=0;i<16;i=i+1) win_n[i] = win[i];
-
-        case (state)
-            S_IDLE: begin
-                if (start) begin
-                    state_n = S_LOAD;
-                end
-            end
+        case(state)
+            S_IDLE: if(start) nxt_state = S_LOAD;
 
             S_LOAD: begin
-                state_n = S_RUN;
-                tbase_n = 6'd0;
-
-                a_n = H0_IV; b_n = H1_IV; c_n = H2_IV; d_n = H3_IV;
-                e_n = H4_IV; f_n = H5_IV; g_n = H6_IV; h_n = H7_IV;
-
-                for (i=0;i<16;i=i+1)
-                    win_n[i] = block_in[511 - 32*i -: 32];
+                nxt_state = S_RUN;
+                nxt_tbase = 6'd0;
+                an=H0_IV; bn=H1_IV; cn=H2_IV; dn=H3_IV;
+                en=H4_IV; fn=H5_IV; gn=H6_IV; hn=H7_IV;
+                for(i=0;i<16;i=i+1)
+                    win_nxt[511-32*i -:32] = block_in[511-32*i -:32];
             end
 
             S_RUN: begin
-                a_n = a8; b_n = b8; c_n = c8; d_n = d8;
-                e_n = e8; f_n = f8; g_n = g8; h_n = h8;
-
-                for (i=0;i<16;i=i+1)
-                    win_n[i] = win_next[511-32*i -: 32];
-
-                if (tbase == 6'd56)
-                    state_n = S_FIN;
-                else
-                    tbase_n = tbase + 6'd8;
+                an=a8; bn=b8; cn=c8; dn=d8;
+                en=e8; fn=f8; gn=g8; hn=h8;
+                for(i=0;i<16;i=i+1)
+                    win_nxt[511-32*i -:32] = win_out[511-32*i -:32];
+                if(tbase==6'd56) nxt_state=S_FIN;
+                else nxt_tbase = tbase+6'd8;
             end
 
             S_FIN: begin
-                digest_valid = 1'b1;
-                state_n = S_IDLE;
+                digest_valid=1'b1;
+                nxt_state=S_IDLE;
             end
         endcase
     end
 
-    // -------------------------
-    // Sequential regs
-    // -------------------------
     always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            state <= S_IDLE;
-            tbase <= 6'd0;
-            {a,b,c,d,e,f,g,h} <= 256'd0;
-            {H0,H1,H2,H3,H4,H5,H6,H7} <= 256'd0;
-            digest <= 256'd0;
-            for (i=0;i<16;i=i+1) win[i] <= 32'd0;
+        if(!rst_n) begin
+            state<=S_IDLE; tbase<=0;
+            {a,b,c,d,e,f,g,h}<=0;
+            {H0,H1,H2,H3,H4,H5,H6,H7}<=0;
+            digest<=0; win<=0;
         end else begin
-            state <= state_n;
-            tbase <= tbase_n;
-
-            a <= a_n; b <= b_n; c <= c_n; d <= d_n;
-            e <= e_n; f <= f_n; g <= g_n; h <= h_n;
-
-            for (i=0;i<16;i=i+1) win[i] <= win_n[i];
-
-            if (state == S_LOAD) begin
-                H0 <= H0_IV; H1 <= H1_IV; H2 <= H2_IV; H3 <= H3_IV;
-                H4 <= H4_IV; H5 <= H5_IV; H6 <= H6_IV; H7 <= H7_IV;
+            state<=nxt_state; tbase<=nxt_tbase;
+            a<=an; b<=bn; c<=cn; d<=dn;
+            e<=en; f<=fn; g<=gn; h<=hn;
+            win<=win_nxt;
+            if(state==S_LOAD) begin
+                H0<=H0_IV; H1<=H1_IV; H2<=H2_IV; H3<=H3_IV;
+                H4<=H4_IV; H5<=H5_IV; H6<=H6_IV; H7<=H7_IV;
             end
-
-            if (state == S_FIN) begin
-                digest <= { H0 + a, H1 + b, H2 + c, H3 + d,
-                            H4 + e, H5 + f, H6 + g, H7 + h };
+            if(state==S_FIN) begin
+                digest <= {H0+a,H1+b,H2+c,H3+d,H4+e,H5+f,H6+g,H7+h};
             end
         end
     end
 endmodule
 
-// -----------------------------------------------------------------------------
-// 8-round combinational SHA-256 round engine
-// -----------------------------------------------------------------------------
-module sha256_round8 (
-    input  wire [31:0] a_in, b_in, c_in, d_in,
-    input  wire [31:0] e_in, f_in, g_in, h_in,
-    input  wire [255:0] W_flat,
-    input  wire [255:0] K_flat,
-    output reg  [31:0] a_out, b_out, c_out, d_out,
-    output reg  [31:0] e_out, f_out, g_out, h_out
+module sha256_round8(
+    input wire [31:0] a_in,b_in,c_in,d_in,
+    input wire [31:0] e_in,f_in,g_in,h_in,
+    input wire [255:0] W_flat,
+    input wire [255:0] K_flat,
+    output reg [31:0] a_out,b_out,c_out,d_out,
+    output reg [31:0] e_out,f_out,g_out,h_out
 );
-    wire [31:0] W [0:7];
-    wire [31:0] K [0:7];
+    wire [31:0] W[0:7]; wire [31:0] K[0:7];
     genvar i;
     generate
-        for (i=0;i<8;i=i+1) begin : UNPACK
-            assign W[i] = W_flat[255-32*i -: 32];
-            assign K[i] = K_flat[255-32*i -: 32];
+        for(i=0;i<8;i=i+1) begin: unpack
+            assign W[i]=W_flat[255-32*i -:32];
+            assign K[i]=K_flat[255-32*i -:32];
         end
     endgenerate
 
     function [31:0] ROTR; input [31:0] x; input integer n;
-        begin ROTR = (x >> n) | (x << (32-n)); end
+        begin ROTR=(x>>n)|(x<<(32-n)); end
     endfunction
     function [31:0] Ch; input [31:0] x,y,z;
-        begin Ch = (x & y) ^ (~x & z); end
+        begin Ch=(x&y)^(~x&z); end
     endfunction
     function [31:0] Maj; input [31:0] x,y,z;
-        begin Maj = (x & y) ^ (x & z) ^ (y & z); end
+        begin Maj=(x&y)^(x&z)^(y&z); end
     endfunction
     function [31:0] S0; input [31:0] x;
-        begin S0 = ROTR(x,2) ^ ROTR(x,13) ^ ROTR(x,22); end
+        begin S0=ROTR(x,2)^ROTR(x,13)^ROTR(x,22); end
     endfunction
     function [31:0] S1; input [31:0] x;
-        begin S1 = ROTR(x,6) ^ ROTR(x,11) ^ ROTR(x,25); end
+        begin S1=ROTR(x,6)^ROTR(x,11)^ROTR(x,25); end
     endfunction
 
     integer j;
-    reg [31:0] a,b,c,d,e,f,g,h;
-    reg [31:0] T1,T2;
-
+    reg [31:0] a,b,c,d,e,f,g,h,T1,T2;
     always @* begin
         a=a_in; b=b_in; c=c_in; d=d_in;
         e=e_in; f=f_in; g=g_in; h=h_in;
-
-        for (j=0;j<8;j=j+1) begin
-            T1 = h + S1(e) + Ch(e,f,g) + K[j] + W[j];
-            T2 = S0(a) + Maj(a,b,c);
-            h = g; g = f; f = e; e = d + T1;
-            d = c; c = b; b = a; a = T1 + T2;
+        for(j=0;j<8;j=j+1) begin
+            T1=h+S1(e)+Ch(e,f,g)+K[j]+W[j];
+            T2=S0(a)+Maj(a,b,c);
+            h=g; g=f; f=e; e=d+T1;
+            d=c; c=b; b=a; a=T1+T2;
         end
-
         a_out=a; b_out=b; c_out=c; d_out=d;
         e_out=e; f_out=f; g_out=g; h_out=h;
     end
 endmodule
 
-// -----------------------------------------------------------------------------
-// Message schedule (8 rounds/cycle)
-// -----------------------------------------------------------------------------
-module sha256_msg_sched8 (
-    input  wire [511:0] win_in,
+module sha256_msg_sched8(
+    input wire [511:0] win_in,
     output wire [255:0] W_flat,
     output wire [511:0] win_out
 );
     function [31:0] ROTR; input [31:0] x; input integer n;
-        begin ROTR = (x >> n) | (x << (32-n)); end
+        begin ROTR=(x>>n)|(x<<(32-n)); end
     endfunction
     function [31:0] SHR; input [31:0] x; input integer n;
-        begin SHR = x >> n; end
+        begin SHR=x>>n; end
     endfunction
     function [31:0] s0; input [31:0] x;
-        begin s0 = ROTR(x,7) ^ ROTR(x,18) ^ SHR(x,3); end
+        begin s0=ROTR(x,7)^ROTR(x,18)^SHR(x,3); end
     endfunction
     function [31:0] s1; input [31:0] x;
-        begin s1 = ROTR(x,17) ^ ROTR(x,19) ^ SHR(x,10); end
+        begin s1=ROTR(x,17)^ROTR(x,19)^SHR(x,10); end
     endfunction
 
-    wire [31:0] temp [0:23];
+    wire [31:0] tmp[0:23];
     genvar i;
     generate
-        for (i=0;i<16;i=i+1) assign temp[i] = win_in[i];
-        for (i=16;i<24;i=i+1)
-            assign temp[i] = s1(temp[i-2]) + temp[i-7] + s0(temp[i-15]) + temp[i-16];
-    endgenerate
-
-    generate
-        for (i=0;i<8;i=i+1)
-            assign W_flat[255-32*i -: 32] = temp[i];
-        for (i=0;i<16;i=i+1)
-            assign win_out[511-32*i -: 32] = temp[8+i];
+        for(i=0;i<16;i=i+1) assign tmp[i]=win_in[511-32*i -:32];
+        for(i=16;i<24;i=i+1) assign tmp[i]=s1(tmp[i-2])+tmp[i-7]+s0(tmp[i-15])+tmp[i-16];
+        for(i=0;i<8;i=i+1) assign W_flat[255-32*i -:32]=tmp[i];
+        for(i=0;i<16;i=i+1) assign win_out[511-32*i -:32]=tmp[8+i];
     endgenerate
 endmodule
 
-// -----------------------------------------------------------------------------
-// K ROM
-// -----------------------------------------------------------------------------
-module sha256_krom8 (
-    input  wire [5:0]  tbase,
+module sha256_krom8(
+    input wire [5:0] tbase,
     output wire [255:0] K_flat
 );
-    reg [31:0] K [0:63];
+    reg [31:0] K[0:63];
     integer i;
     initial begin
         K[0]=32'h428a2f98; K[1]=32'h71374491; K[2]=32'hb5c0fbcf; K[3]=32'he9b5dba5;
@@ -281,7 +210,7 @@ module sha256_krom8 (
 
     genvar j;
     generate
-        for (j=0;j<8;j=j+1)
-            assign K_flat[255-32*j -: 32] = K[tbase+j];
+        for(j=0;j<8;j=j+1)
+            assign K_flat[255-32*j -:32]=K[tbase+j];
     endgenerate
 endmodule
